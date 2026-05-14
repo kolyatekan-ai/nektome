@@ -1,0 +1,156 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============ Enums ============
+
+enum UserStatus {
+  ONLINE
+  IDLE
+  DND
+  OFFLINE
+}
+
+enum ChannelType {
+  TEXT
+  VOICE
+  CATEGORY
+  DM
+}
+
+// ============ Models ============
+
+model User {
+  id           String     @id @default(cuid())
+  email        String     @unique
+  username     String     @unique
+  displayName  String
+  passwordHash String
+  avatarUrl    String?
+  status       UserStatus @default(OFFLINE)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  ownedServers Server[]   @relation("ServerOwner")
+  memberships  Member[]
+  messages     Message[]
+  reactions    Reaction[]
+
+  @@index([username])
+}
+
+model Server {
+  id         String   @id @default(cuid())
+  name       String
+  iconUrl    String?
+  ownerId    String
+  inviteCode String   @unique @default(cuid())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  owner    User      @relation("ServerOwner", fields: [ownerId], references: [id])
+  channels Channel[]
+  members  Member[]
+  roles    Role[]
+
+  @@index([ownerId])
+}
+
+model Channel {
+  id        String      @id @default(cuid())
+  serverId  String
+  name      String
+  type      ChannelType @default(TEXT)
+  position  Int         @default(0)
+  topic     String?
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  server   Server    @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  messages Message[]
+
+  @@index([serverId])
+}
+
+model Message {
+  id        String    @id @default(cuid())
+  channelId String
+  authorId  String
+  content   String    @db.Text
+  editedAt  DateTime?
+  createdAt DateTime  @default(now())
+
+  channel     Channel      @relation(fields: [channelId], references: [id], onDelete: Cascade)
+  author      User         @relation(fields: [authorId], references: [id])
+  attachments Attachment[]
+  reactions   Reaction[]
+
+  @@index([channelId, createdAt])
+}
+
+model Member {
+  id       String   @id @default(cuid())
+  userId   String
+  serverId String
+  nickname String?
+  joinedAt DateTime @default(now())
+
+  user   User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  server Server       @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  roles  MemberRole[]
+
+  @@unique([userId, serverId])
+  @@index([serverId])
+}
+
+model Role {
+  id          String @id @default(cuid())
+  serverId    String
+  name        String
+  color       String @default("#99AAB5")
+  position    Int    @default(0)
+  permissions BigInt @default(0)
+
+  server  Server       @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  members MemberRole[]
+
+  @@index([serverId])
+}
+
+model MemberRole {
+  memberId String
+  roleId   String
+
+  member Member @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  role   Role   @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([memberId, roleId])
+}
+
+model Attachment {
+  id        String  @id @default(cuid())
+  messageId String
+  url       String
+  filename  String
+  size      Int
+  mimeType  String
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+}
+
+model Reaction {
+  id        String @id @default(cuid())
+  messageId String
+  userId    String
+  emoji     String
+
+  message Message @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([messageId, userId, emoji])
+}
