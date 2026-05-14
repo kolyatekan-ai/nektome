@@ -18,14 +18,31 @@ interface ServerWithDetails extends ServerDto {
 
 export interface VoiceState {
   channelId: string;
-  serverId: string;
+  serverId: string | null; // null for DM call
   channelName: string;
+  isDM: boolean;
   peers: VoicePeerView[];
   muted: boolean;
+  cameraOn: boolean;
+  screenOn: boolean;
+  /** local camera track for self-preview */
+  localCameraTrack: MediaStreamTrack | null;
+  localScreenTrack: MediaStreamTrack | null;
 }
 
-// per-channel public participant counts (used to badge channel sidebar)
+export interface IncomingCall {
+  fromUserId: string;
+  fromUsername: string;
+  fromDisplayName: string;
+  fromAvatarUrl: string | null;
+  channelId: string; // synthetic dm:userA:userB id
+}
+
 type VoiceCounts = Record<string, number>;
+
+function dmChannelId(a: string, b: string): string {
+  return `dm:${[a, b].sort().join(':')}`;
+}
 
 interface AppState {
   servers: ServerDto[];
@@ -36,6 +53,8 @@ interface AppState {
   typing: Record<string, { userId: string; username: string; ts: number }[]>;
   voiceCounts: VoiceCounts;
   voice: VoiceState | null;
+  incomingCall: IncomingCall | null;
+  outgoingCall: { toUserId: string; toDisplayName: string; channelId: string } | null;
 
   loadServers: () => Promise<void>;
   selectServer: (serverId: string) => Promise<void>;
@@ -55,6 +74,15 @@ interface AppState {
   joinVoice: (channelId: string) => Promise<void>;
   leaveVoice: () => Promise<void>;
   toggleMute: () => void;
+  toggleCamera: () => Promise<void>;
+  toggleScreen: () => Promise<void>;
+
+  // DM calls
+  startDmCall: (toUser: UserPublic, ownUserId: string) => Promise<void>;
+  acceptIncomingCall: (ownUserId: string) => Promise<void>;
+  declineIncomingCall: () => void;
+  cancelOutgoingCall: () => void;
+  dismissIncoming: () => void;
 }
 
 export const useApp = create<AppState>((set, get) => ({
@@ -66,6 +94,8 @@ export const useApp = create<AppState>((set, get) => ({
   typing: {},
   voiceCounts: {},
   voice: null,
+  incomingCall: null,
+  outgoingCall: null,
 
   async loadServers() {
     const servers = await api.myServers();
@@ -94,7 +124,6 @@ export const useApp = create<AppState>((set, get) => ({
   async selectChannel(channelId) {
     const channel = get().activeServer?.channels.find((c) => c.id === channelId);
     if (channel?.type === 'VOICE') {
-      // voice channel — join voice instead of swapping the chat pane
       await get().joinVoice(channelId);
       return;
     }
@@ -142,6 +171,9 @@ export const useApp = create<AppState>((set, get) => ({
     socket.off('message:delete');
     socket.off('channel:typing');
     socket.off('voice:state');
+    socket.off('call:incoming');
+    socket.off('call:cancelled');
+    socket.off('call:declined');
 
     socket.on('message:new', ({ message }: { message: MessageDto }) => {
       set((state) => {
@@ -219,6 +251,27 @@ export const useApp = create<AppState>((set, get) => ({
         }));
       },
     );
+
+    socket.on('call:incoming', (data: IncomingCall) => {
+      // ignore if I'm already in a call
+      if (get().voice) return;
+      set({ incomingCall: data });
+    });
+    socket.on('call:cancelled', (data: { fromUserId: string }) => {
+      const inc = get().incomingCall;
+      if (inc && inc.fromUserId === data.fromUserId) {
+        set({ incomingCall: null });
+      }
+    });
+    socket.on('call:declined', () => {
+      // outgoing was rejected
+      set({ outgoingCall: null });
+      // also leave voice if we already joined waiting
+      const v = get().voice;
+      if (v && v.isDM) {
+        get().leaveVoice();
+      }
+    });
   },
 
   notifyTyping(channelId) {
@@ -238,7 +291,7 @@ export const useApp = create<AppState>((set, get) => ({
     const vc = getVoiceClient(socket);
     try {
       await vc.join(channelId);
-    } catch (e) {
+    } catch {
       alert(
         'Microphone access denied. Allow mic in your browser to join voice.',
       );
@@ -250,8 +303,13 @@ export const useApp = create<AppState>((set, get) => ({
         channelId,
         serverId: server.id,
         channelName: channel.name,
+        isDM: false,
         peers: [],
         muted: false,
+        cameraOn: false,
+        screenOn: false,
+        localCameraTrack: null,
+        localScreenTrack: null,
       },
     });
 
@@ -259,6 +317,20 @@ export const useApp = create<AppState>((set, get) => ({
       const v = get().voice;
       if (!v) return;
       set({ voice: { ...v, peers } });
+    });
+    vc.onLocalCameraChange((t) => {
+      const v = get().voice;
+      if (!v) return;
+      set({
+        voice: { ...v, cameraOn: !!t, localCameraTrack: t },
+      });
+    });
+    vc.onLocalScreenChange((t) => {
+      const v = get().voice;
+      if (!v) return;
+      set({
+        voice: { ...v, screenOn: !!t, localScreenTrack: t },
+      });
     });
   },
 
@@ -277,5 +349,154 @@ export const useApp = create<AppState>((set, get) => ({
     const next = !v.muted;
     vc.setMuted(next);
     set({ voice: { ...v, muted: next } });
+  },
+
+  async toggleCamera() {
+    const v = get().voice;
+    if (!v) return;
+    const socket = getSocket();
+    const vc = getVoiceClient(socket);
+    try {
+      await vc.toggleCamera();
+    } catch (e) {
+      alert((e as Error).message);
+    }
+  },
+
+  async toggleScreen() {
+    const v = get().voice;
+    if (!v) return;
+    const socket = getSocket();
+    const vc = getVoiceClient(socket);
+    try {
+      await vc.toggleScreenShare();
+    } catch (e) {
+      // user cancelled the share dialog — ignore silently
+    }
+  },
+
+  // ===== DM CALLS =====
+
+  async startDmCall(toUser, ownUserId) {
+    const channelId = dmChannelId(ownUserId, toUser.id);
+    const socket = getSocket();
+    const vc = getVoiceClient(socket);
+
+    // join the voice room first so we are ready to receive offers
+    try {
+      await vc.join(channelId, { isDM: true });
+    } catch {
+      alert('Microphone access denied.');
+      return;
+    }
+    set({
+      voice: {
+        channelId,
+        serverId: null,
+        channelName: toUser.displayName,
+        isDM: true,
+        peers: [],
+        muted: false,
+        cameraOn: false,
+        screenOn: false,
+        localCameraTrack: null,
+        localScreenTrack: null,
+      },
+      outgoingCall: {
+        toUserId: toUser.id,
+        toDisplayName: toUser.displayName,
+        channelId,
+      },
+    });
+    vc.onChange((peers) => {
+      const v = get().voice;
+      if (!v) return;
+      set({ voice: { ...v, peers } });
+      // outgoing call answered → clear outgoing toast
+      if (peers.length > 0 && get().outgoingCall) {
+        set({ outgoingCall: null });
+      }
+    });
+    vc.onLocalCameraChange((t) => {
+      const v = get().voice;
+      if (!v) return;
+      set({ voice: { ...v, cameraOn: !!t, localCameraTrack: t } });
+    });
+    vc.onLocalScreenChange((t) => {
+      const v = get().voice;
+      if (!v) return;
+      set({ voice: { ...v, screenOn: !!t, localScreenTrack: t } });
+    });
+
+    socket.emit('call:invite', { toUserId: toUser.id, channelId });
+  },
+
+  async acceptIncomingCall(ownUserId) {
+    const inc = get().incomingCall;
+    if (!inc) return;
+    set({ incomingCall: null });
+
+    const socket = getSocket();
+    const vc = getVoiceClient(socket);
+    try {
+      await vc.join(inc.channelId, { isDM: true });
+    } catch {
+      alert('Microphone access denied.');
+      return;
+    }
+    set({
+      voice: {
+        channelId: inc.channelId,
+        serverId: null,
+        channelName: inc.fromDisplayName,
+        isDM: true,
+        peers: [],
+        muted: false,
+        cameraOn: false,
+        screenOn: false,
+        localCameraTrack: null,
+        localScreenTrack: null,
+      },
+    });
+    vc.onChange((peers) => {
+      const v = get().voice;
+      if (!v) return;
+      set({ voice: { ...v, peers } });
+    });
+    vc.onLocalCameraChange((t) => {
+      const v = get().voice;
+      if (!v) return;
+      set({ voice: { ...v, cameraOn: !!t, localCameraTrack: t } });
+    });
+    vc.onLocalScreenChange((t) => {
+      const v = get().voice;
+      if (!v) return;
+      set({ voice: { ...v, screenOn: !!t, localScreenTrack: t } });
+    });
+  },
+
+  declineIncomingCall() {
+    const inc = get().incomingCall;
+    if (!inc) return;
+    getSocket().emit('call:decline', {
+      toUserId: inc.fromUserId,
+      channelId: inc.channelId,
+    });
+    set({ incomingCall: null });
+  },
+
+  cancelOutgoingCall() {
+    const out = get().outgoingCall;
+    if (!out) return;
+    getSocket().emit('call:cancel', {
+      toUserId: out.toUserId,
+      channelId: out.channelId,
+    });
+    set({ outgoingCall: null });
+    get().leaveVoice();
+  },
+
+  dismissIncoming() {
+    set({ incomingCall: null });
   },
 }));

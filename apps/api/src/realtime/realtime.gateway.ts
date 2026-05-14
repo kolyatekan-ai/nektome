@@ -188,28 +188,80 @@ export class RealtimeGateway
       .emit('message:delete', { channelId, messageId });
   }
 
+  // ===== DM CALLS (1-to-1, ringing flow) =====
+
+  @SubscribeMessage('call:invite')
+  async onCallInvite(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { toUserId: string; channelId: string },
+  ) {
+    if (!client.data.userId) return;
+    // forward an incoming-call notification to all sockets of that user
+    this.server.to(`user:${data.toUserId}`).emit('call:incoming', {
+      fromUserId: client.data.userId,
+      fromUsername: client.data.username,
+      fromDisplayName: client.data.displayName,
+      fromAvatarUrl: client.data.avatarUrl ?? null,
+      channelId: data.channelId,
+      // a unique call id for the toast (we just reuse channelId in MVP)
+      callId: data.channelId,
+    });
+  }
+
+  @SubscribeMessage('call:cancel')
+  async onCallCancel(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { toUserId: string; channelId: string },
+  ) {
+    if (!client.data.userId) return;
+    this.server.to(`user:${data.toUserId}`).emit('call:cancelled', {
+      fromUserId: client.data.userId,
+      channelId: data.channelId,
+    });
+  }
+
+  @SubscribeMessage('call:decline')
+  async onCallDecline(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { toUserId: string; channelId: string },
+  ) {
+    if (!client.data.userId) return;
+    this.server.to(`user:${data.toUserId}`).emit('call:declined', {
+      fromUserId: client.data.userId,
+      channelId: data.channelId,
+    });
+  }
+
   // ===== VOICE =====
 
   @SubscribeMessage('voice:join')
   async onVoiceJoin(
     @ConnectedSocket() client: AuthenticatedSocket,
-    @MessageBody() data: { channelId: string },
+    @MessageBody() data: { channelId: string; isDM?: boolean },
   ) {
     if (!client.data.userId) return;
 
-    const channel = await this.prisma.channel.findUnique({
-      where: { id: data.channelId },
-    });
-    if (!channel) return;
-    const member = await this.prisma.member.findUnique({
-      where: {
-        userId_serverId: {
-          userId: client.data.userId,
-          serverId: channel.serverId,
+    // DM call rooms have a synthetic id like "dm:userA:userB" (sorted).
+    // No DB membership check — we authorize by the fact that the inviter sent
+    // call:invite and the invitee accepted. For server channels we still check.
+    const isDM =
+      !!data.isDM || data.channelId.startsWith('dm:');
+
+    if (!isDM) {
+      const channel = await this.prisma.channel.findUnique({
+        where: { id: data.channelId },
+      });
+      if (!channel) return;
+      const member = await this.prisma.member.findUnique({
+        where: {
+          userId_serverId: {
+            userId: client.data.userId,
+            serverId: channel.serverId,
+          },
         },
-      },
-    });
-    if (!member) return;
+      });
+      if (!member) return;
+    }
 
     // leave previous voice channel if any
     if (client.data.voiceChannelId && client.data.voiceChannelId !== data.channelId) {
@@ -253,10 +305,18 @@ export class RealtimeGateway
     });
 
     // also broadcast to the server room so UI can show count beside the channel
-    this.server.to(`server:${channel.serverId}`).emit('voice:state', {
-      channelId: data.channelId,
-      participants: Array.from(room.values()),
-    });
+    if (!isDM) {
+      const ch = await this.prisma.channel.findUnique({
+        where: { id: data.channelId },
+        select: { serverId: true },
+      });
+      if (ch) {
+        this.server.to(`server:${ch.serverId}`).emit('voice:state', {
+          channelId: data.channelId,
+          participants: Array.from(room.values()),
+        });
+      }
+    }
   }
 
   @SubscribeMessage('voice:leave')

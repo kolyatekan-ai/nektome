@@ -3,14 +3,18 @@
 import type { Socket } from 'socket.io-client';
 
 /**
- * VoiceClient — manages WebRTC peer connections for a voice channel.
+ * VoiceClient — manages WebRTC peer connections (audio + video + screen share).
  *
- * Architecture: full mesh.
- *  - When you join a voice channel, the server tells you about existing peers.
- *  - You create an RTCPeerConnection per peer and SEND offer to each.
- *  - Existing peers receive 'voice:peer-joined' and wait for offer (perfect-negotiation lite).
+ * Architecture: full mesh, suitable for ~6-8 participants.
+ *  - Each peer maintains an RTCPeerConnection per other peer.
+ *  - When you join, server tells you about existing peers → you create OFFERS.
+ *  - Existing peers receive 'voice:peer-joined' and respond with ANSWER.
  *
- * Free, no SFU — works for ~6-8 participants comfortably on a residential connection.
+ * Tracks:
+ *  - Always: 1 audio track (mic).
+ *  - Optional: 1 camera video track.
+ *  - Optional: 1 screen share video track (separate from camera).
+ *  - We tag screen tracks via track.contentHint = 'screen' to distinguish them.
  */
 
 const STUN_SERVERS: RTCIceServer[] = [
@@ -27,7 +31,10 @@ export interface VoicePeerView {
   avatarUrl: string | null;
   muted: boolean;
   speaking: boolean;
+  /** mixed inbound stream containing remote audio + camera + screen tracks */
   stream: MediaStream | null;
+  hasVideo: boolean;
+  hasScreen: boolean;
 }
 
 type Listener = (peers: VoicePeerView[]) => void;
@@ -35,23 +42,59 @@ type Listener = (peers: VoicePeerView[]) => void;
 export class VoiceClient {
   private socket: Socket;
   private channelId: string | null = null;
-  private localStream: MediaStream | null = null;
+  private localStream: MediaStream | null = null; // mic + camera (camera optional)
+  private screenStream: MediaStream | null = null; // screen capture
   private peers = new Map<string, RTCPeerConnection>();
   private peerInfo = new Map<string, VoicePeerView>();
+  private screenSenders = new Map<string, RTCRtpSender>();
   private speakingDetector: ReturnType<typeof setInterval> | null = null;
   private listeners = new Set<Listener>();
   private localMuted = false;
   private localSpeaking = false;
+  private cameraEnabled = false;
+  private screenEnabled = false;
   private audioCtx: AudioContext | null = null;
   private localAnalyser: AnalyserNode | null = null;
+  private localVideoListeners = new Set<
+    (track: MediaStreamTrack | null) => void
+  >();
+  private localScreenListeners = new Set<
+    (track: MediaStreamTrack | null) => void
+  >();
 
   constructor(socket: Socket) {
     this.socket = socket;
     this.bindServerEvents();
   }
 
+  // ===== public state getters =====
+
+  isMuted() {
+    return this.localMuted;
+  }
+  isCameraOn() {
+    return this.cameraEnabled;
+  }
+  isScreenOn() {
+    return this.screenEnabled;
+  }
+  getCurrentChannelId() {
+    return this.channelId;
+  }
+  getLocalCameraTrack(): MediaStreamTrack | null {
+    return (
+      this.localStream
+        ?.getVideoTracks()
+        .find((t) => t.contentHint !== 'screen') ?? null
+    );
+  }
+  getLocalScreenTrack(): MediaStreamTrack | null {
+    return this.screenStream?.getVideoTracks()[0] ?? null;
+  }
+
+  // ===== signaling event handlers =====
+
   private bindServerEvents() {
-    // Existing peers list at join time → we are the offerer
     this.socket.on(
       'voice:peers',
       async (data: { channelId: string; participants: any[] }) => {
@@ -62,7 +105,6 @@ export class VoiceClient {
       },
     );
 
-    // New peer joined after us → they will offer us, we just register info
     this.socket.on(
       'voice:peer-joined',
       (data: { channelId: string; participant: any }) => {
@@ -77,6 +119,8 @@ export class VoiceClient {
           muted: !!p.muted,
           speaking: false,
           stream: null,
+          hasVideo: false,
+          hasScreen: false,
         });
         this.notify();
       },
@@ -119,7 +163,6 @@ export class VoiceClient {
       let pc = this.peers.get(fromId);
       const signal = data.signal;
 
-      // Inbound offer from a freshly joined peer → become answerer
       if (signal.type === 'offer') {
         if (!pc) {
           const info = this.peerInfo.get(fromId);
@@ -153,16 +196,17 @@ export class VoiceClient {
         try {
           await pc.addIceCandidate(signal.candidate);
         } catch {
-          /* ignore late ICE */
+          /* late ICE */
         }
       }
     });
   }
 
-  async join(channelId: string): Promise<void> {
+  // ===== join / leave =====
+
+  async join(channelId: string, opts?: { isDM?: boolean }): Promise<void> {
     if (this.channelId) await this.leave();
 
-    // request mic
     this.localStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         echoCancellation: true,
@@ -174,7 +218,7 @@ export class VoiceClient {
 
     this.channelId = channelId;
     this.startSpeakingDetector();
-    this.socket.emit('voice:join', { channelId });
+    this.socket.emit('voice:join', { channelId, isDM: !!opts?.isDM });
   }
 
   async leave(): Promise<void> {
@@ -188,10 +232,15 @@ export class VoiceClient {
     }
     this.peers.clear();
     this.peerInfo.clear();
+    this.screenSenders.clear();
 
     if (this.localStream) {
       this.localStream.getTracks().forEach((t) => t.stop());
       this.localStream = null;
+    }
+    if (this.screenStream) {
+      this.screenStream.getTracks().forEach((t) => t.stop());
+      this.screenStream = null;
     }
     if (this.audioCtx) {
       try {
@@ -204,8 +253,14 @@ export class VoiceClient {
     }
     this.channelId = null;
     this.localMuted = false;
+    this.cameraEnabled = false;
+    this.screenEnabled = false;
+    this.notifyLocalCamera(null);
+    this.notifyLocalScreen(null);
     this.notify();
   }
+
+  // ===== mic =====
 
   setMuted(muted: boolean) {
     this.localMuted = muted;
@@ -215,13 +270,157 @@ export class VoiceClient {
     this.socket.emit('voice:mute', { muted });
   }
 
-  isMuted() {
-    return this.localMuted;
+  // ===== camera =====
+
+  async toggleCamera(): Promise<void> {
+    if (this.cameraEnabled) {
+      this.stopCamera();
+    } else {
+      await this.startCamera();
+    }
   }
 
-  getCurrentChannelId() {
-    return this.channelId;
+  async startCamera(): Promise<void> {
+    if (!this.localStream || this.cameraEnabled) return;
+    let camStream: MediaStream;
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          frameRate: { ideal: 30 },
+        },
+        audio: false,
+      });
+    } catch {
+      throw new Error('Camera access denied');
+    }
+    const track = camStream.getVideoTracks()[0];
+    if (!track) return;
+    track.contentHint = 'motion';
+    this.localStream.addTrack(track);
+
+    for (const [peerId, pc] of this.peers) {
+      const sender = pc.addTrack(track, this.localStream);
+      (sender as any).__kind = 'camera';
+      await this.renegotiate(peerId, pc);
+    }
+
+    this.cameraEnabled = true;
+    this.notifyLocalCamera(track);
+    this.notify();
   }
+
+  stopCamera() {
+    if (!this.localStream) return;
+    const track = this.localStream
+      .getVideoTracks()
+      .find((t) => t.contentHint !== 'screen');
+    if (!track) return;
+    track.stop();
+    this.localStream.removeTrack(track);
+
+    for (const [peerId, pc] of this.peers) {
+      const senders = pc.getSenders();
+      for (const s of senders) {
+        if ((s as any).__kind === 'camera' || s.track === track) {
+          try {
+            pc.removeTrack(s);
+          } catch {
+            /* */
+          }
+        }
+      }
+      this.renegotiate(peerId, pc).catch(() => undefined);
+    }
+
+    this.cameraEnabled = false;
+    this.notifyLocalCamera(null);
+    this.notify();
+  }
+
+  // ===== screen share =====
+
+  async toggleScreenShare(): Promise<void> {
+    if (this.screenEnabled) {
+      this.stopScreenShare();
+    } else {
+      await this.startScreenShare();
+    }
+  }
+
+  async startScreenShare(): Promise<void> {
+    if (this.screenEnabled) return;
+    let stream: MediaStream;
+    try {
+      stream = await (navigator.mediaDevices as any).getDisplayMedia({
+        video: { frameRate: { ideal: 30 } },
+        audio: false,
+      });
+    } catch {
+      throw new Error('Screen share denied');
+    }
+    const track = stream.getVideoTracks()[0];
+    if (!track) return;
+    track.contentHint = 'screen';
+    this.screenStream = stream;
+    track.onended = () => this.stopScreenShare();
+
+    for (const [peerId, pc] of this.peers) {
+      const sender = pc.addTrack(track, stream);
+      (sender as any).__kind = 'screen';
+      this.screenSenders.set(peerId, sender);
+      await this.renegotiate(peerId, pc);
+    }
+
+    this.screenEnabled = true;
+    this.notifyLocalScreen(track);
+    this.notify();
+  }
+
+  stopScreenShare() {
+    if (!this.screenEnabled && !this.screenStream) return;
+    if (this.screenStream) {
+      this.screenStream.getTracks().forEach((t) => t.stop());
+      this.screenStream = null;
+    }
+    for (const [peerId, pc] of this.peers) {
+      const sender = this.screenSenders.get(peerId);
+      if (sender) {
+        try {
+          pc.removeTrack(sender);
+        } catch {
+          /* */
+        }
+        this.screenSenders.delete(peerId);
+        this.renegotiate(peerId, pc).catch(() => undefined);
+      }
+    }
+    this.screenEnabled = false;
+    this.notifyLocalScreen(null);
+    this.notify();
+  }
+
+  // ===== local-video listeners (for self-preview tile) =====
+
+  onLocalCameraChange(cb: (track: MediaStreamTrack | null) => void) {
+    this.localVideoListeners.add(cb);
+    cb(this.getLocalCameraTrack());
+    return () => this.localVideoListeners.delete(cb);
+  }
+  onLocalScreenChange(cb: (track: MediaStreamTrack | null) => void) {
+    this.localScreenListeners.add(cb);
+    cb(this.getLocalScreenTrack());
+    return () => this.localScreenListeners.delete(cb);
+  }
+  private notifyLocalCamera(t: MediaStreamTrack | null) {
+    this.localVideoListeners.forEach((l) => l(t));
+  }
+  private notifyLocalScreen(t: MediaStreamTrack | null) {
+    this.localScreenListeners.forEach((l) => l(t));
+  }
+
+  // ===== peer state =====
 
   onChange(listener: Listener) {
     this.listeners.add(listener);
@@ -263,13 +462,25 @@ export class VoiceClient {
       muted: !!p.muted,
       speaking: false,
       stream: null,
+      hasVideo: false,
+      hasScreen: false,
     };
     this.peerInfo.set(p.socketId, view);
 
-    // add local audio
     if (this.localStream) {
       for (const track of this.localStream.getTracks()) {
-        pc.addTrack(track, this.localStream);
+        const sender = pc.addTrack(track, this.localStream);
+        if (track.kind === 'video') {
+          (sender as any).__kind =
+            track.contentHint === 'screen' ? 'screen' : 'camera';
+        }
+      }
+    }
+    if (this.screenStream) {
+      for (const track of this.screenStream.getVideoTracks()) {
+        const sender = pc.addTrack(track, this.screenStream);
+        (sender as any).__kind = 'screen';
+        this.screenSenders.set(p.socketId, sender);
       }
     }
 
@@ -284,30 +495,77 @@ export class VoiceClient {
     };
 
     pc.ontrack = (e) => {
-      const stream = e.streams[0] ?? new MediaStream([e.track]);
-      view.stream = stream;
-      // play audio
-      const audio = document.createElement('audio');
-      audio.autoplay = true;
-      audio.srcObject = stream;
-      audio.dataset.peerId = p.socketId;
-      audio.style.display = 'none';
-      document.body.appendChild(audio);
-      audio.play().catch(() => undefined);
+      let stream = view.stream;
+      if (!stream) {
+        stream = new MediaStream();
+        view.stream = stream;
+      }
+      if (!stream.getTracks().includes(e.track)) {
+        stream.addTrack(e.track);
+      }
+
+      if (e.track.kind === 'audio') {
+        const audio = document.createElement('audio');
+        audio.autoplay = true;
+        audio.srcObject = new MediaStream([e.track]);
+        audio.dataset.peerId = p.socketId;
+        audio.style.display = 'none';
+        document.body.appendChild(audio);
+        audio.play().catch(() => undefined);
+      }
+
+      this.recomputePeerVideoFlags(view, stream);
+
+      e.track.onended = () => {
+        try {
+          stream!.removeTrack(e.track);
+        } catch {
+          /* */
+        }
+        this.recomputePeerVideoFlags(view, stream!);
+        this.notify();
+      };
+
       this.notify();
     };
 
+    pc.onconnectionstatechange = () => {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+        this.cleanupPeer(p.socketId);
+        this.notify();
+      }
+    };
+
     if (isOfferer) {
+      await this.renegotiate(p.socketId, pc);
+    }
+
+    this.notify();
+  }
+
+  private recomputePeerVideoFlags(view: VoicePeerView, stream: MediaStream) {
+    let hasVideo = false;
+    let hasScreen = false;
+    for (const t of stream.getVideoTracks()) {
+      if (t.contentHint === 'screen') hasScreen = true;
+      else hasVideo = true;
+    }
+    view.hasVideo = hasVideo;
+    view.hasScreen = hasScreen;
+  }
+
+  private async renegotiate(peerId: string, pc: RTCPeerConnection) {
+    try {
       const offer = await pc.createOffer();
       await pc.setLocalDescription(offer);
       this.socket.emit('voice:signal', {
         channelId: this.channelId,
-        toSocketId: p.socketId,
+        toSocketId: peerId,
         signal: { type: 'offer', sdp: offer.sdp },
       });
+    } catch {
+      /* peer left or ICE racing */
     }
-
-    this.notify();
   }
 
   private cleanupPeer(socketId: string) {
@@ -321,12 +579,14 @@ export class VoiceClient {
       this.peers.delete(socketId);
     }
     this.peerInfo.delete(socketId);
+    this.screenSenders.delete(socketId);
 
-    // remove the audio element
     document
       .querySelectorAll(`audio[data-peer-id="${socketId}"]`)
       .forEach((el) => el.remove());
   }
+
+  // ===== voice activity =====
 
   private startSpeakingDetector() {
     if (!this.localStream) return;

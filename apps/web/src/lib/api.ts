@@ -77,6 +77,12 @@ export const api = {
     return request<UserPublic>('/auth/me');
   },
 
+  // ---- users ----
+  listUsers(q?: string) {
+    const qs = q ? `?q=${encodeURIComponent(q)}` : '';
+    return request<UserPublic[]>(`/users${qs}`);
+  },
+
   // ---- servers ----
   myServers() {
     return request<ServerDto[]>('/servers/me');
