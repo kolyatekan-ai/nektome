@@ -53,6 +53,8 @@ COPY --from=builder /app/apps/api/node_modules ./apps/api/node_modules
 
 EXPOSE 4000
 
-# On first boot of an empty DB: try migrate deploy, fall back to db push
-# (safe because the schema-only push creates everything from scratch).
-CMD ["sh", "-c", "cd apps/api && (npx prisma migrate deploy 2>/dev/null || npx prisma db push --skip-generate --accept-data-loss) && cd /app && node apps/api/dist/main.js"]
+# On every boot: sync the schema with the database via 'prisma db push'.
+# Idempotent — if the DB already matches the schema, nothing happens.
+# We use 'db push' (not 'migrate deploy') because we don't ship migration
+# files in the MVP — the prisma schema is the source of truth.
+CMD ["sh", "-c", "cd apps/api && npx prisma db push --skip-generate --accept-data-loss && cd /app && node apps/api/dist/main.js"]
