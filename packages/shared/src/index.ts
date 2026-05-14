@@ -40,20 +40,40 @@ export interface MessageDto {
   createdAt: string;
 }
 
+// ============= Voice =============
+
+export interface VoiceParticipant {
+  userId: string;
+  username: string;
+  displayName: string;
+  avatarUrl: string | null;
+  socketId: string;
+  muted: boolean;
+}
+
 // ============= WebSocket events =============
 
 export const WS_EVENTS = {
-  // server -> client
+  // text chat
   MESSAGE_NEW: "message:new",
   MESSAGE_EDIT: "message:edit",
   MESSAGE_DELETE: "message:delete",
   TYPING: "channel:typing",
   PRESENCE_UPDATE: "presence:update",
-
-  // client -> server
   JOIN_CHANNEL: "channel:join",
   LEAVE_CHANNEL: "channel:leave",
   TYPING_START: "channel:typing:start",
+
+  // voice
+  VOICE_JOIN: "voice:join",
+  VOICE_LEAVE: "voice:leave",
+  VOICE_MUTE: "voice:mute",
+  VOICE_PEERS: "voice:peers",
+  VOICE_PEER_JOINED: "voice:peer-joined",
+  VOICE_PEER_LEFT: "voice:peer-left",
+  VOICE_PEER_MUTED: "voice:peer-muted",
+  VOICE_SIGNAL: "voice:signal",
+  VOICE_SPEAKING: "voice:speaking",
 } as const;
 
 export interface WsMessageNewPayload {
@@ -64,6 +84,25 @@ export interface WsTypingPayload {
   channelId: string;
   userId: string;
   username: string;
+}
+
+export interface VoiceSignalPayload {
+  channelId: string;
+  fromSocketId: string;
+  toSocketId: string;
+  signal:
+    | { type: "offer" | "answer"; sdp: string }
+    | { type: "ice"; candidate: RTCIceCandidateInit };
+}
+
+export interface VoicePeerJoinedPayload {
+  channelId: string;
+  participant: VoiceParticipant;
+}
+
+export interface VoicePeersPayload {
+  channelId: string;
+  participants: VoiceParticipant[];
 }
 
 // ============= Auth DTOs =============

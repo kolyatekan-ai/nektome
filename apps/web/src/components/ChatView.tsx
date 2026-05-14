@@ -33,13 +33,11 @@ export default function ChatView() {
     (t) => now - t.ts < 5000 && t.userId !== user?.id,
   );
 
-  // tick to expire typing indicators
   useEffect(() => {
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
   }, []);
 
-  // auto-scroll to bottom on new messages
   useEffect(() => {
     if (scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
@@ -48,8 +46,11 @@ export default function ChatView() {
 
   if (!channel) {
     return (
-      <main className="flex flex-1 items-center justify-center bg-bgChat text-textMuted">
-        Select a channel to start chatting
+      <main className="relative z-10 flex flex-1 items-center justify-center bg-bgChat">
+        <div className="text-center">
+          <div className="mb-3 text-3xl">💬</div>
+          <div className="text-textMuted">Select a channel to start chatting</div>
+        </div>
       </main>
     );
   }
@@ -77,21 +78,28 @@ export default function ChatView() {
   }
 
   return (
-    <main className="flex flex-1 flex-col bg-bgChat">
-      <header className="flex h-12 items-center gap-2 border-b border-black/30 px-4 shadow-sm">
-        <span className="text-textMuted">#</span>
+    <main className="relative z-10 flex flex-1 flex-col bg-bgChat">
+      <header className="relative flex h-14 items-center gap-2 border-b border-border px-5">
+        <span className="text-textMuted text-lg">#</span>
         <span className="font-semibold text-white">{channel.name}</span>
         {channel.topic && (
           <>
-            <span className="mx-2 text-textMuted">|</span>
+            <span className="mx-2 h-4 w-px bg-border" />
             <span className="text-sm text-textMuted">{channel.topic}</span>
           </>
         )}
+        <span className="absolute inset-x-0 bottom-0 h-px bg-gradient-to-r from-transparent via-accent/15 to-transparent" />
       </header>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-5 py-4">
         {channelMessages.length === 0 && (
-          <div className="text-textMuted">No messages yet — be the first!</div>
+          <div className="flex h-full items-center justify-center">
+            <div className="rounded-2xl border border-border bg-bgPanel/40 px-6 py-4 text-center text-textMuted">
+              <div className="text-3xl mb-2">✨</div>
+              <div>No messages yet</div>
+              <div className="text-xs mt-1">Be the first to write something!</div>
+            </div>
+          </div>
         )}
         {channelMessages.map((m, i) => {
           const prev = channelMessages[i - 1];
@@ -105,13 +113,13 @@ export default function ChatView() {
           return (
             <div
               key={m.id}
-              className={`flex gap-3 ${
+              className={`group flex gap-3 rounded-md px-2 ${
                 sameAuthorAsPrev ? 'mt-0.5' : 'mt-4'
-              } hover:bg-black/10`}
+              } hover:bg-bgPanel/40`}
             >
-              <div className="w-10 shrink-0">
+              <div className="w-10 shrink-0 pt-0.5">
                 {!sameAuthorAsPrev && (
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-accent text-sm font-bold text-white">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-gradient-to-br from-accent to-accentDark text-sm font-bold text-bgDeep ring-1 ring-accent/20">
                     {m.author.displayName[0]?.toUpperCase() ?? '?'}
                   </div>
                 )}
@@ -130,7 +138,7 @@ export default function ChatView() {
                 <div className="whitespace-pre-wrap break-words text-textMain">
                   {m.content}
                   {m.editedAt && (
-                    <span className="ml-1 text-xs text-textMuted">
+                    <span className="ml-1 text-[11px] text-textMuted">
                       (edited)
                     </span>
                   )}
@@ -141,23 +149,40 @@ export default function ChatView() {
         })}
       </div>
 
-      <div className="px-4 pb-1 text-xs text-textMuted">
+      <div className="px-5 pb-1 text-xs text-textMuted h-5">
         {activeTypers.length > 0 && (
-          <span>
-            {activeTypers.map((t) => t.username).join(', ')}{' '}
-            {activeTypers.length === 1 ? 'is' : 'are'} typing…
+          <span className="flex items-center gap-1.5">
+            <span className="flex gap-0.5">
+              <span
+                className="h-1 w-1 animate-pulse rounded-full bg-accent"
+                style={{ animationDelay: '0ms' }}
+              />
+              <span
+                className="h-1 w-1 animate-pulse rounded-full bg-accent"
+                style={{ animationDelay: '200ms' }}
+              />
+              <span
+                className="h-1 w-1 animate-pulse rounded-full bg-accent"
+                style={{ animationDelay: '400ms' }}
+              />
+            </span>
+            <span>
+              {activeTypers.map((t) => t.username).join(', ')}{' '}
+              {activeTypers.length === 1 ? 'is' : 'are'} typing…
+            </span>
           </span>
         )}
-        &nbsp;
       </div>
 
-      <form onSubmit={onSubmit} className="px-4 pb-4">
-        <input
-          value={input}
-          onChange={(e) => onChange(e.target.value)}
-          placeholder={`Message #${channel.name}`}
-          className="w-full rounded-lg bg-bgInput px-4 py-3 text-textMain outline-none placeholder:text-textMuted"
-        />
+      <form onSubmit={onSubmit} className="px-5 pb-5">
+        <div className="relative">
+          <input
+            value={input}
+            onChange={(e) => onChange(e.target.value)}
+            placeholder={`Message #${channel.name}`}
+            className="w-full rounded-xl border border-border bg-bgInput px-4 py-3.5 text-textMain shadow-panel outline-none transition-colors placeholder:text-textMuted focus:border-accent/40 focus:bg-bgPanel"
+          />
+        </div>
       </form>
     </main>
   );

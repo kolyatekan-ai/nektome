@@ -29,7 +29,13 @@ export default function ServerSidebar() {
   }
 
   return (
-    <nav className="flex h-full w-[72px] flex-col items-center gap-2 bg-bgDeep py-3">
+    <nav className="relative z-10 flex h-full w-[80px] flex-col items-center gap-2.5 bg-bgDeep py-4">
+      {/* logo */}
+      <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-accent-grad text-bgDeep shadow-glow font-bold text-lg select-none">
+        B
+      </div>
+      <div className="my-1 h-px w-8 bg-border" />
+
       {servers.map((s) => {
         const initials = s.name
           .split(/\s+/)
@@ -42,16 +48,28 @@ export default function ServerSidebar() {
             key={s.id}
             onClick={() => selectServer(s.id)}
             title={s.name}
-            className={`group relative flex h-12 w-12 items-center justify-center rounded-3xl bg-bgSidebar font-semibold text-textMain transition-all hover:rounded-2xl hover:bg-accent hover:text-white ${
-              active ? 'rounded-2xl bg-accent text-white' : ''
+            className={`group relative flex h-12 w-12 items-center justify-center overflow-hidden rounded-2xl bg-bgPanel font-semibold text-textSoft transition-all duration-200 hover:bg-bgPanelHi hover:text-white hover:shadow-glow-sm ${
+              active
+                ? 'bg-accent-grad text-bgDeep shadow-glow ring-1 ring-accent/50'
+                : ''
             }`}
+            style={
+              active
+                ? {}
+                : {
+                    backgroundImage:
+                      'linear-gradient(135deg, rgba(255,255,255,0.04), transparent)',
+                  }
+            }
           >
             <span
-              className={`absolute -left-3 w-1 rounded-r bg-white transition-all ${
-                active ? 'h-10' : 'h-0 group-hover:h-5'
+              className={`absolute -left-1 w-1 rounded-r-full bg-accent transition-all ${
+                active
+                  ? 'h-8 shadow-[0_0_8px_rgba(125,211,252,0.6)]'
+                  : 'h-0 group-hover:h-4'
               }`}
             />
-            {initials || '?'}
+            <span className="relative">{initials || '?'}</span>
           </button>
         );
       })}
@@ -59,24 +77,24 @@ export default function ServerSidebar() {
       <div className="relative">
         <button
           onClick={() => setShowMenu((v) => !v)}
-          className="flex h-12 w-12 items-center justify-center rounded-3xl bg-bgSidebar text-2xl text-success transition-all hover:rounded-2xl hover:bg-success hover:text-white"
+          className="flex h-12 w-12 items-center justify-center rounded-2xl border border-success/30 bg-bgPanel text-2xl text-success transition-all hover:border-success hover:bg-success/10 hover:shadow-[0_0_16px_rgba(52,211,153,0.3)]"
           title="Add a server"
         >
           +
         </button>
         {showMenu && (
-          <div className="absolute left-16 top-0 z-50 w-48 rounded-md bg-bgInput p-2 shadow-xl">
+          <div className="glass titanium-border absolute left-16 top-0 z-50 w-52 rounded-xl p-1.5">
             <button
               onClick={onCreate}
-              className="block w-full rounded px-3 py-2 text-left text-sm text-textMain hover:bg-accent hover:text-white"
+              className="block w-full rounded-lg px-3 py-2 text-left text-sm text-textMain transition-colors hover:bg-accent/10 hover:text-accent"
             >
-              Create server
+              ✨ Create server
             </button>
             <button
               onClick={onJoin}
-              className="block w-full rounded px-3 py-2 text-left text-sm text-textMain hover:bg-accent hover:text-white"
+              className="block w-full rounded-lg px-3 py-2 text-left text-sm text-textMain transition-colors hover:bg-accent/10 hover:text-accent"
             >
-              Join via invite
+              🎟 Join via invite
             </button>
           </div>
         )}
@@ -86,7 +104,7 @@ export default function ServerSidebar() {
 
       <button
         onClick={logout}
-        className="flex h-12 w-12 items-center justify-center rounded-3xl bg-bgSidebar text-textMuted transition-all hover:rounded-2xl hover:bg-danger hover:text-white"
+        className="flex h-12 w-12 items-center justify-center rounded-2xl bg-bgPanel text-textMuted transition-all hover:bg-danger/10 hover:text-danger"
         title="Log out"
       >
         ⎋

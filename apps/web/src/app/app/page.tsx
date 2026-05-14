@@ -3,6 +3,7 @@
 import ServerSidebar from '@/components/ServerSidebar';
 import ChannelSidebar from '@/components/ChannelSidebar';
 import ChatView from '@/components/ChatView';
+import VoicePanel from '@/components/VoicePanel';
 
 export default function AppPage() {
   return (
@@ -10,6 +11,7 @@ export default function AppPage() {
       <ServerSidebar />
       <ChannelSidebar />
       <ChatView />
+      <VoicePanel />
     </>
   );
 }

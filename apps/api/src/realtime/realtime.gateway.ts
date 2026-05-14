@@ -17,7 +17,20 @@ interface AuthenticatedSocket extends Socket {
   data: {
     userId?: string;
     username?: string;
+    displayName?: string;
+    avatarUrl?: string | null;
+    voiceChannelId?: string | null;
+    muted?: boolean;
   };
+}
+
+interface VoiceParticipant {
+  userId: string;
+  username: string;
+  displayName: string;
+  avatarUrl: string | null;
+  socketId: string;
+  muted: boolean;
 }
 
 @WebSocketGateway({
@@ -27,11 +40,17 @@ interface AuthenticatedSocket extends Socket {
       .map((o) => o.trim()),
     credentials: true,
   },
+  // Allow both transports for stability behind Render's proxy
+  transports: ['websocket', 'polling'],
 })
 export class RealtimeGateway
   implements OnGatewayConnection, OnGatewayDisconnect
 {
   private readonly logger = new Logger(RealtimeGateway.name);
+
+  // In-memory voice room registry: channelId -> Map<socketId, VoiceParticipant>
+  // (acceptable for single-instance free-tier; for HA migrate to Redis)
+  private voiceRooms = new Map<string, Map<string, VoiceParticipant>>();
 
   @WebSocketServer()
   server!: Server;
@@ -58,12 +77,30 @@ export class RealtimeGateway
         secret: process.env.JWT_ACCESS_SECRET ?? 'dev_access_secret',
       });
 
-      client.data.userId = payload.sub;
-      client.data.username = payload.username;
+      const user = await this.prisma.user.findUnique({
+        where: { id: payload.sub },
+        select: {
+          id: true,
+          username: true,
+          displayName: true,
+          avatarUrl: true,
+        },
+      });
+      if (!user) {
+        client.disconnect();
+        return;
+      }
+
+      client.data.userId = user.id;
+      client.data.username = user.username;
+      client.data.displayName = user.displayName;
+      client.data.avatarUrl = user.avatarUrl;
+      client.data.muted = false;
+      client.data.voiceChannelId = null;
 
       // Auto-join all channel rooms the user is a member of
       const memberships = await this.prisma.member.findMany({
-        where: { userId: payload.sub },
+        where: { userId: user.id },
         include: { server: { include: { channels: true } } },
       });
 
@@ -73,10 +110,10 @@ export class RealtimeGateway
           await client.join(`channel:${ch.id}`);
         }
       }
-      await client.join(`user:${payload.sub}`);
+      await client.join(`user:${user.id}`);
 
       this.logger.log(
-        `Connected ${payload.username} (${payload.sub}) — joined ${memberships.length} servers`,
+        `Connected ${user.username} (${user.id}) — joined ${memberships.length} servers`,
       );
     } catch (err) {
       this.logger.warn(`WS auth failed: ${(err as Error).message}`);
@@ -86,11 +123,13 @@ export class RealtimeGateway
 
   handleDisconnect(client: AuthenticatedSocket) {
     if (client.data.userId) {
+      // remove from voice room if was in one
+      this.removeFromVoice(client);
       this.logger.log(`Disconnected ${client.data.username}`);
     }
   }
 
-  // ===== client -> server events =====
+  // ===== text chat events =====
 
   @SubscribeMessage('channel:join')
   async onJoin(
@@ -98,7 +137,6 @@ export class RealtimeGateway
     @MessageBody() data: { channelId: string },
   ) {
     if (!client.data.userId) return;
-    // Verify membership before joining the room
     const channel = await this.prisma.channel.findUnique({
       where: { id: data.channelId },
     });
@@ -132,23 +170,189 @@ export class RealtimeGateway
     client.to(`channel:${data.channelId}`).emit('channel:typing', {
       channelId: data.channelId,
       userId: client.data.userId,
-      username: client.data.username,
+      username: client.data.displayName ?? client.data.username,
     });
   }
 
-  // ===== server-side broadcast helpers (called from MessagesService) =====
+  // ===== text broadcast helpers =====
 
   broadcastNewMessage(channelId: string, message: unknown) {
     this.server.to(`channel:${channelId}`).emit('message:new', { message });
   }
-
   broadcastEditMessage(channelId: string, message: unknown) {
     this.server.to(`channel:${channelId}`).emit('message:edit', { message });
   }
-
   broadcastDeleteMessage(channelId: string, messageId: string) {
     this.server
       .to(`channel:${channelId}`)
       .emit('message:delete', { channelId, messageId });
+  }
+
+  // ===== VOICE =====
+
+  @SubscribeMessage('voice:join')
+  async onVoiceJoin(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { channelId: string },
+  ) {
+    if (!client.data.userId) return;
+
+    const channel = await this.prisma.channel.findUnique({
+      where: { id: data.channelId },
+    });
+    if (!channel) return;
+    const member = await this.prisma.member.findUnique({
+      where: {
+        userId_serverId: {
+          userId: client.data.userId,
+          serverId: channel.serverId,
+        },
+      },
+    });
+    if (!member) return;
+
+    // leave previous voice channel if any
+    if (client.data.voiceChannelId && client.data.voiceChannelId !== data.channelId) {
+      this.removeFromVoice(client);
+    }
+
+    client.data.voiceChannelId = data.channelId;
+    client.data.muted = false;
+
+    const participant: VoiceParticipant = {
+      userId: client.data.userId,
+      username: client.data.username ?? 'unknown',
+      displayName: client.data.displayName ?? client.data.username ?? 'unknown',
+      avatarUrl: client.data.avatarUrl ?? null,
+      socketId: client.id,
+      muted: false,
+    };
+
+    let room = this.voiceRooms.get(data.channelId);
+    if (!room) {
+      room = new Map();
+      this.voiceRooms.set(data.channelId, room);
+    }
+    room.set(client.id, participant);
+
+    await client.join(`voice:${data.channelId}`);
+
+    // send list of EXISTING peers to the joiner (so they create offers)
+    const existingPeers = Array.from(room.values()).filter(
+      (p) => p.socketId !== client.id,
+    );
+    client.emit('voice:peers', {
+      channelId: data.channelId,
+      participants: existingPeers,
+    });
+
+    // notify others that a new peer joined
+    client.to(`voice:${data.channelId}`).emit('voice:peer-joined', {
+      channelId: data.channelId,
+      participant,
+    });
+
+    // also broadcast to the server room so UI can show count beside the channel
+    this.server.to(`server:${channel.serverId}`).emit('voice:state', {
+      channelId: data.channelId,
+      participants: Array.from(room.values()),
+    });
+  }
+
+  @SubscribeMessage('voice:leave')
+  async onVoiceLeave(@ConnectedSocket() client: AuthenticatedSocket) {
+    this.removeFromVoice(client);
+  }
+
+  @SubscribeMessage('voice:mute')
+  async onVoiceMute(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { muted: boolean },
+  ) {
+    if (!client.data.voiceChannelId) return;
+    const room = this.voiceRooms.get(client.data.voiceChannelId);
+    if (!room) return;
+    const me = room.get(client.id);
+    if (!me) return;
+    me.muted = !!data.muted;
+    client.data.muted = me.muted;
+    client
+      .to(`voice:${client.data.voiceChannelId}`)
+      .emit('voice:peer-muted', {
+        channelId: client.data.voiceChannelId,
+        socketId: client.id,
+        muted: me.muted,
+      });
+  }
+
+  @SubscribeMessage('voice:signal')
+  async onVoiceSignal(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody()
+    data: {
+      channelId: string;
+      toSocketId: string;
+      signal: unknown;
+    },
+  ) {
+    if (!client.data.voiceChannelId) return;
+    if (client.data.voiceChannelId !== data.channelId) return;
+    // forward signal to the target socket
+    this.server.to(data.toSocketId).emit('voice:signal', {
+      channelId: data.channelId,
+      fromSocketId: client.id,
+      toSocketId: data.toSocketId,
+      signal: data.signal,
+    });
+  }
+
+  @SubscribeMessage('voice:speaking')
+  async onVoiceSpeaking(
+    @ConnectedSocket() client: AuthenticatedSocket,
+    @MessageBody() data: { speaking: boolean },
+  ) {
+    if (!client.data.voiceChannelId) return;
+    client
+      .to(`voice:${client.data.voiceChannelId}`)
+      .emit('voice:speaking', {
+        channelId: client.data.voiceChannelId,
+        socketId: client.id,
+        speaking: !!data.speaking,
+      });
+  }
+
+  private removeFromVoice(client: AuthenticatedSocket) {
+    const channelId = client.data.voiceChannelId;
+    if (!channelId) return;
+
+    const room = this.voiceRooms.get(channelId);
+    if (room) {
+      room.delete(client.id);
+      if (room.size === 0) {
+        this.voiceRooms.delete(channelId);
+      }
+    }
+
+    client.to(`voice:${channelId}`).emit('voice:peer-left', {
+      channelId,
+      socketId: client.id,
+    });
+    client.leave(`voice:${channelId}`);
+
+    // broadcast updated count to server room
+    this.prisma.channel
+      .findUnique({ where: { id: channelId } })
+      .then((ch) => {
+        if (ch) {
+          this.server.to(`server:${ch.serverId}`).emit('voice:state', {
+            channelId,
+            participants: room ? Array.from(room.values()) : [],
+          });
+        }
+      })
+      .catch(() => undefined);
+
+    client.data.voiceChannelId = null;
+    client.data.muted = false;
   }
 }

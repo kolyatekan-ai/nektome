@@ -102,10 +102,14 @@ export const api = {
   },
 
   // ---- channels ----
-  createChannel(serverId: string, name: string) {
+  createChannel(
+    serverId: string,
+    name: string,
+    type: 'TEXT' | 'VOICE' = 'TEXT',
+  ) {
     return request<ChannelDto>(`/servers/${serverId}/channels`, {
       method: 'POST',
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, type }),
     });
   },
 

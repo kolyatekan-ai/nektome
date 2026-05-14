@@ -1,22 +1,41 @@
 'use client';
 
 import { create } from 'zustand';
-import type { ChannelDto, MessageDto, ServerDto, UserPublic } from '@burmalda/shared';
+import type {
+  ChannelDto,
+  MessageDto,
+  ServerDto,
+  UserPublic,
+} from '@burmalda/shared';
 import { api } from '@/lib/api';
 import { getSocket } from '@/lib/socket';
+import { getVoiceClient, type VoicePeerView } from '@/lib/voice';
 
 interface ServerWithDetails extends ServerDto {
   channels: ChannelDto[];
   members: { userId: string; user: UserPublic }[];
 }
 
+export interface VoiceState {
+  channelId: string;
+  serverId: string;
+  channelName: string;
+  peers: VoicePeerView[];
+  muted: boolean;
+}
+
+// per-channel public participant counts (used to badge channel sidebar)
+type VoiceCounts = Record<string, number>;
+
 interface AppState {
   servers: ServerDto[];
   activeServerId: string | null;
   activeServer: ServerWithDetails | null;
   activeChannelId: string | null;
-  messages: Record<string, MessageDto[]>; // by channelId
+  messages: Record<string, MessageDto[]>;
   typing: Record<string, { userId: string; username: string; ts: number }[]>;
+  voiceCounts: VoiceCounts;
+  voice: VoiceState | null;
 
   loadServers: () => Promise<void>;
   selectServer: (serverId: string) => Promise<void>;
@@ -24,9 +43,18 @@ interface AppState {
   sendMessage: (channelId: string, content: string) => Promise<void>;
   createServer: (name: string) => Promise<void>;
   joinServer: (inviteCode: string) => Promise<void>;
-  createChannel: (serverId: string, name: string) => Promise<void>;
+  createChannel: (
+    serverId: string,
+    name: string,
+    type?: 'TEXT' | 'VOICE',
+  ) => Promise<void>;
   initSocket: () => void;
   notifyTyping: (channelId: string) => void;
+
+  // voice
+  joinVoice: (channelId: string) => Promise<void>;
+  leaveVoice: () => Promise<void>;
+  toggleMute: () => void;
 }
 
 export const useApp = create<AppState>((set, get) => ({
@@ -36,6 +64,8 @@ export const useApp = create<AppState>((set, get) => ({
   activeChannelId: null,
   messages: {},
   typing: {},
+  voiceCounts: {},
+  voice: null,
 
   async loadServers() {
     const servers = await api.myServers();
@@ -50,14 +80,24 @@ export const useApp = create<AppState>((set, get) => ({
     set({
       activeServerId: serverId,
       activeServer: server,
-      activeChannelId: server.channels[0]?.id ?? null,
+      activeChannelId:
+        server.channels.find((c) => c.type === 'TEXT')?.id ??
+        server.channels[0]?.id ??
+        null,
     });
-    if (server.channels[0]) {
-      await get().selectChannel(server.channels[0].id);
+    const firstText = server.channels.find((c) => c.type === 'TEXT');
+    if (firstText) {
+      await get().selectChannel(firstText.id);
     }
   },
 
   async selectChannel(channelId) {
+    const channel = get().activeServer?.channels.find((c) => c.id === channelId);
+    if (channel?.type === 'VOICE') {
+      // voice channel — join voice instead of swapping the chat pane
+      await get().joinVoice(channelId);
+      return;
+    }
     set({ activeChannelId: channelId });
     if (!get().messages[channelId]) {
       const messages = await api.listMessages(channelId);
@@ -65,13 +105,10 @@ export const useApp = create<AppState>((set, get) => ({
         messages: { ...state.messages, [channelId]: messages },
       }));
     }
-    // ensure socket joined this channel room (auto-join already covers existing channels;
-    // emit explicit join to handle channels created after WS connect)
     getSocket().emit('channel:join', { channelId });
   },
 
   async sendMessage(channelId, content) {
-    // optimistic UI: server will broadcast via socket; we just call REST
     await api.sendMessage(channelId, content);
   },
 
@@ -89,10 +126,11 @@ export const useApp = create<AppState>((set, get) => ({
     await get().selectServer(server.id);
   },
 
-  async createChannel(serverId, name) {
-    await api.createChannel(serverId, name);
+  async createChannel(serverId, name, type = 'TEXT') {
+    await api.createChannel(serverId, name, type);
     if (get().activeServerId === serverId) {
-      await get().selectServer(serverId);
+      const server = await api.getServer(serverId);
+      set({ activeServer: server });
     }
   },
 
@@ -103,11 +141,11 @@ export const useApp = create<AppState>((set, get) => ({
     socket.off('message:edit');
     socket.off('message:delete');
     socket.off('channel:typing');
+    socket.off('voice:state');
 
     socket.on('message:new', ({ message }: { message: MessageDto }) => {
       set((state) => {
         const list = state.messages[message.channelId] ?? [];
-        // de-dupe
         if (list.some((m) => m.id === message.id)) return state;
         return {
           messages: {
@@ -169,9 +207,75 @@ export const useApp = create<AppState>((set, get) => ({
         });
       },
     );
+
+    socket.on(
+      'voice:state',
+      (data: { channelId: string; participants: any[] }) => {
+        set((state) => ({
+          voiceCounts: {
+            ...state.voiceCounts,
+            [data.channelId]: data.participants.length,
+          },
+        }));
+      },
+    );
   },
 
   notifyTyping(channelId) {
     getSocket().emit('channel:typing:start', { channelId });
+  },
+
+  // ===== voice =====
+
+  async joinVoice(channelId) {
+    const server = get().activeServer;
+    const channel = server?.channels.find((c) => c.id === channelId);
+    if (!server || !channel) return;
+
+    if (get().voice?.channelId === channelId) return;
+
+    const socket = getSocket();
+    const vc = getVoiceClient(socket);
+    try {
+      await vc.join(channelId);
+    } catch (e) {
+      alert(
+        'Microphone access denied. Allow mic in your browser to join voice.',
+      );
+      return;
+    }
+
+    set({
+      voice: {
+        channelId,
+        serverId: server.id,
+        channelName: channel.name,
+        peers: [],
+        muted: false,
+      },
+    });
+
+    vc.onChange((peers) => {
+      const v = get().voice;
+      if (!v) return;
+      set({ voice: { ...v, peers } });
+    });
+  },
+
+  async leaveVoice() {
+    const socket = getSocket();
+    const vc = getVoiceClient(socket);
+    await vc.leave();
+    set({ voice: null });
+  },
+
+  toggleMute() {
+    const v = get().voice;
+    if (!v) return;
+    const socket = getSocket();
+    const vc = getVoiceClient(socket);
+    const next = !v.muted;
+    vc.setMuted(next);
+    set({ voice: { ...v, muted: next } });
   },
 }));
