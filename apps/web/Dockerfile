@@ -2,6 +2,7 @@
 FROM node:20-alpine AS builder
 WORKDIR /app
 
+RUN apk add --no-cache libc6-compat
 RUN npm i -g pnpm@9.15.4
 
 # Build-time public envs are baked into the bundle by Next.js
@@ -10,12 +11,16 @@ ARG NEXT_PUBLIC_WS_URL=http://localhost:4000
 ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
 ENV NEXT_PUBLIC_WS_URL=$NEXT_PUBLIC_WS_URL
 
+# Reduce memory footprint for Render Free (512MB)
+ENV NODE_OPTIONS="--max-old-space-size=460"
+ENV NEXT_TELEMETRY_DISABLED=1
+
 # workspace manifests for cached install
-COPY package.json pnpm-lock.yaml* pnpm-workspace.yaml .npmrc* ./
+COPY package.json pnpm-workspace.yaml ./
 COPY apps/web/package.json apps/web/
 COPY packages/shared/package.json packages/shared/
 
-RUN pnpm install --no-frozen-lockfile
+RUN pnpm install --no-frozen-lockfile --ignore-scripts
 
 # sources
 COPY tsconfig.base.json ./
@@ -28,17 +33,19 @@ RUN pnpm --filter @burmalda/web build
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
+ENV NEXT_TELEMETRY_DISABLED=1
+ENV NODE_OPTIONS="--max-old-space-size=420"
 
-RUN npm i -g pnpm@9.15.4
-
+# copy app + ALL node_modules (root + nested)
+COPY --from=builder /app/package.json /app/pnpm-workspace.yaml ./
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/packages/shared ./packages/shared
 COPY --from=builder /app/apps/web/.next ./apps/web/.next
 COPY --from=builder /app/apps/web/public ./apps/web/public
 COPY --from=builder /app/apps/web/package.json ./apps/web/
 COPY --from=builder /app/apps/web/node_modules ./apps/web/node_modules
-COPY --from=builder /app/packages/shared ./packages/shared
-COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/package.json /app/pnpm-workspace.yaml ./
 
 EXPOSE 3000
 WORKDIR /app/apps/web
-CMD ["node", "node_modules/next/dist/bin/next", "start", "-p", "3000", "-H", "0.0.0.0"]
+# Use $PORT (provided by Render) at runtime, fallback to 3000 locally
+CMD ["sh", "-c", "node node_modules/next/dist/bin/next start -p ${PORT:-3000} -H 0.0.0.0"]

@@ -20,11 +20,16 @@ async function bootstrap() {
     }),
   );
 
-  const port = parseInt(process.env.API_PORT ?? '4000', 10);
-  await app.listen(port);
+  // Render / Fly / generic PaaS provide PORT. Fall back to API_PORT, then 4000.
+  const port = parseInt(
+    process.env.PORT ?? process.env.API_PORT ?? '4000',
+    10,
+  );
+  // Bind to 0.0.0.0 so the container is reachable from outside (required by Render).
+  await app.listen(port, '0.0.0.0');
 
   // eslint-disable-next-line no-console
-  console.log(`[Burmalda API] listening on http://localhost:${port}`);
+  console.log(`[Burmalda API] listening on 0.0.0.0:${port}`);
 }
 
 bootstrap();
